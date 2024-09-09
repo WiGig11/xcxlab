@@ -67,13 +67,13 @@ class GatedConv(nn.Module):
         )
         # mask part
         if full:
-            self.mask = self.conv = nn.Sequential(
+            self.mask  = nn.Sequential(
                 nn.ReflectionPad2d(padding),
                 nn.Conv2d(in_channels, out_channels, kernel_size,stride,padding = 0,dilation = dilation,bias=bias),
                 nn.Sigmoid()
             )
         else:
-            self.mask = self.conv = nn.Sequential(
+            self.mask  = nn.Sequential(
                 nn.ReflectionPad2d(padding),
                 nn.Conv2d(in_channels, 1, kernel_size,stride,padding = 0,dilation = dilation,bias=bias),
                 nn.Sigmoid()
@@ -425,16 +425,12 @@ class Decoder2(nn.Module):
     def forward(self, fea):
         conv1 = self.decoder_conv1(fea)
         up1 = self.up1(conv1)
-
         conv2 = self.decoder_conv2(up1)
         up2 = self.up2(conv2)
-
         conv3 = self.decoder_conv3(up2)
         up3 = self.up3(conv3)
-
         conv4 = self.decoder_conv4(up3)
         output = self.final_conv(conv4)
-
         return output
 
 class memory_Block(nn.Module):
@@ -481,7 +477,9 @@ class memory_Block(nn.Module):
         self.memory = updated_memory
     
     def forward(self, E):
-        pass
+        E_output, softmax_score_query, softmax_score_memory = self.read(E)
+        self.update(E,softmax_score_memory)
+        return E_output
 
 class Inpainting(nn.Module):
     def __init__(self,encoder2,decoder2,memory_block):
