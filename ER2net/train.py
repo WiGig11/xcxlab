@@ -2,10 +2,9 @@ import os
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
 
 import torchvision
-from torchvision import datasets, transforms
+from torchvision import transforms
 import torchvision.transforms as transforms
 
 
@@ -16,8 +15,8 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.strategies.ddp import DDPStrategy
 from pytorch_lightning.loggers import TensorBoardLogger
 
-from model import MTNet
-from loss.mixure_loss import MixtureLossImage,MixtureLossFeature,MSEImageLoss
+from model import MTNet,RFM,eyeFlowNet
+from loss import PxielLoss,VGGLoss,BinaryFocalLoss,FlowLoss,EyeSymmetryLoss,WeightLoss
 
 from argparse import ArgumentParser
 from termcolor import colored
@@ -86,34 +85,33 @@ def train_feature_sc(hparams):
     output: training
     """
     # define the basic parts
-    encoder = Encoder(out_channels=8)
-    decoder = Decoder(in_channels=8)
+    C = 512
+    M = 256
+    rfm = RFM()
+    eyenet = eyeFlowNet()
+    rec_loss = PxielLoss()
+    prece_loss = VGGLoss()
+    focal_loss = BinaryFocalLoss()
+    flow_loss = FlowLoss()
+    eye_loss = EyeSymmetryLoss()
+    weight_loss = WeightLoss()
+    
     # determine whether to use the ckpt
     ckpt_addr = hparams.ckpt_addr
-
     print(colored('====>','red')+ckpt_addr)
     if len(ckpt_addr)==0:
-        model = DeepJSCC(
-            encoder=encoder,decoder=decoder,
-            loss_module=MSEImageLoss(),
-            channel=AWGNChannel(),lr = 1e-4,lr_scheduler=hparams.lr_scheduler_type)
-        #pdb.set_trace()
+        model = MTNet(C,M,rfm,eyenet,rec_loss,prece_loss,focal_loss,weight_loss,flow_loss,eye_loss,lr = 1e-4)
     else:
-        model= DeepJSCC.load_from_checkpoint(
+        model = MTNet.load_from_checkpoint(
             ckpt_addr,
-            encoder=encoder,decoder=decoder,
-            loss_module=MSEImageLoss(),
-            channel=AWGNChannel(),lr = 1e-4,lr_scheduler = hparams.lr_scheduler_type
-            )
+            C,M,rfm,eyenet,rec_loss,prece_loss,focal_loss,weight_loss,flow_loss,eye_loss,lr = 1e-4)
         print(colored('========》','red')+"model done")
     print(model)
     # print model summary
     if boolean_transfer(hparams.print_model_summary):
         print(ModelSummary(model,-1))
-
     # define model hparams
     batch_size = int(hparams.batch_size)
-
     # build up SCDataloader instance
     '''
     sc_dataloader = SCDataloader(batch_size)
@@ -121,11 +119,8 @@ def train_feature_sc(hparams):
     train_loader = sc_dataloader.train_dataloader()
     val_loader = sc_dataloader.val_dataloader()
     '''
-    
     transform = transforms.Compose([transforms.ToTensor(),
                                     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
-    #transform = transforms.Compose([transforms.ToTensor()])
-    #                                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))])
     trainset = torchvision.datasets.CIFAR10(root='./cifar_data', train=True,download=True, transform=transform)
     valset = torchvision.datasets.CIFAR10(root='./cifar_data', train=False,download=True, transform=transform)
     train_loader = torch.utils.data.DataLoader(trainset, batch_size=batch_size,shuffle=True, num_workers=15,pin_memory = True)
@@ -134,12 +129,7 @@ def train_feature_sc(hparams):
     logger = TensorBoardLogger("logs",name = "deepjsccAF/")
     # define call backs
     callbacks = [pl.callbacks.ModelCheckpoint(every_n_epochs=int(hparams.save_ckpt_every_n_epochs),save_top_k = 2,monitor="val_loss",mode="min"),
-                 EarlyStopping(monitor = 'val_loss',min_delta=0.0005, patience=50)]
-    #callbacks = []
-    '''
-    callbacks = [pl.callbacks.ModelCheckpoint(every_n_epochs=int(hparams.save_ckpt_every_n_epochs),save_top_k = -1),
-                ]
-    ''' 
+                EarlyStopping(monitor = 'val_loss',min_delta=0.0005, patience=50)]
     #define profiler:
     profiler = hparams.profiler
     #define trainer
@@ -177,17 +167,6 @@ def train_feature_sc(hparams):
                         #strategy='ddp_find_unused_parameters_true'
                         strategy = DDPStrategy(find_unused_parameters=False)
                         )
-    # Run learning rate finder
-    if boolean_transfer(hparams.find_init_lr) == True:
-        print(colored('==============','blue')+"Looking for best lr"+colored('==================-','blue'))
-        tuner = Tuner(trainer)
-        lr_finder = tuner.lr_find(model,train_loader,val_loader)
-        new_lr = lr_finder.suggestion()
-        optimizer = model.configure_optimizers()
-        update_model(optimizer,new_lr,hparams.milestones)
-        if hparams.plot_lr:
-            fig = lr_finder.plot(suggest=True,show= False)
-            fig.savefig('lr_plot.png')
     # start training!
     print(colored('=======================','yellow')+"Starting training!"+colored('=======================','yellow'))
     trainer.fit(model,train_loader, val_loader)
@@ -212,7 +191,3 @@ if __name__ == "__main__":
     parser.add_argument("--find_init_lr",type=str,default=False)
     args = parser.parse_args()
     main(args)
-# conda activate deepjscc && clear && python run_training_deepjscc.py --ckpt_addr '/home/k1928-4/chz/code1/logs/deepjscc/version_8/checkpoints/epoch=395-step=2048000.ckpt' --batch_size 16 --device [0] --max_epoches 1000 --plot_lr True --check_val_every_n_epoch 10 --save_ckpt_every_n_epochs 10 --milestones [250,500,750]
-#python run_training_deepjscc.py --ckpt_addr '/home/k1928-4/chz/code1/logs/deepjscc/version_8/checkpoints/epoch=395-step=2048000.ckpt' --batch_size 16 --device 1 --max_epoches 1000 --plot_lr True --check_val_every_n_epoch 10 --save_ckpt_every_n_epochs 10 --milestones [250,500,750] --fast_dev_run False
-    #python run_training_deepjscc.py --ckpt_addr '' --max_epoches 10 --batch_size 64 --fast_dev_run False --lr_scheduler_type step --find_init_lr False --device 1
-    #python run_training_deepjscc.py --ckpt_addr '' --max_epoches 10 --batch_size 64 --fast_dev_run False --lr_scheduler_type step --find_init_lr False --device 2
