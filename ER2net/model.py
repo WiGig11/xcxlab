@@ -27,9 +27,297 @@ import time
 3.loss
 
 '''
+'''
+modules:
+pad fucntion, gated_conv,dilation layer,dilation block,up/down block
+'''
+def pad(x, ref=None, h=None, w=None):
+    assert not (ref is None and h is None and w is None)
+    _, _, h1, w1 = x.shape
+    if not ref is None:
+        _, _, h2, w2 = ref.shape
+    else:
+        h2, w2 = h, w
+    if not h1 == h2 or not w1 == w2:
+        x = F.pad(x, (0, w2 - w1, 0, h2 - h1), mode='replicate')
+    return x
 
+def tensor2im(image_tensor, imtype=np.uint8):
+    image_tensor = image_tensor.detach()
+    image_numpy = image_tensor.cpu().float().numpy()
+    image_numpy = np.clip(image_numpy, 0, 1)
+    assert len(image_numpy.shape) in [2, 3] or image_numpy.size == 0
+    if len(image_numpy.shape) == 3:
+        image_numpy = (np.transpose(image_numpy, (1, 2, 0))) * 255.0
+        image_numpy = image_numpy.astype(imtype)
+    else:
+        image_numpy = image_numpy * 255.0
+        image_numpy = image_numpy.astype(imtype)
+    return image_numpy
 
-#MTNet is a three-branches network, including a Detection Branch, an Inpainting Branch and an Elimination Branch, to predict the reflection detection result D, the content inpainting result Ii and the reflection elimination result Ie, respectively.
+class GatedConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, bias=True, norm=None,
+        num_groups=8, act='elu', negative_slope=0.1, inplace=True, full=True, reflect=True):
+        super(GatedConv, self).__init__()
+        #conv part 
+        self.conv = nn.Sequential(
+            nn.ReflectionPad2d(padding),
+            nn.Conv2d(in_channels, out_channels, kernel_size,stride,padding = 0,dilation = dilation,bias=bias),
+            nn.ELU(alpha=1.0)
+        )
+        # mask part
+        if full:
+            self.mask = self.conv = nn.Sequential(
+                nn.ReflectionPad2d(padding),
+                nn.Conv2d(in_channels, out_channels, kernel_size,stride,padding = 0,dilation = dilation,bias=bias),
+                nn.Sigmoid()
+            )
+        else:
+            self.mask = self.conv = nn.Sequential(
+                nn.ReflectionPad2d(padding),
+                nn.Conv2d(in_channels, 1, kernel_size,stride,padding = 0,dilation = dilation,bias=bias),
+                nn.Sigmoid()
+            )
+
+    def forward(self, x):
+        return self.conv(x) * self.mask(x)
+
+class Dilation_Layer(nn.Module):
+    def __init__(self, in_channels, reduction=1):
+        super(Dilation_Layer, self).__init__()
+        self.fc = nn.Sequential(
+            nn.Linear( in_channels * 3,  in_channels * 3 // reduction),
+            nn.ELU(inplace=True),
+            nn.Linear( in_channels * 3 // reduction,  in_channels),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        with torch.no_grad():
+            _mean = x.mean(dim=[2, 3])
+            _std = x.std(dim=[2, 3])
+            _max = x.max(dim=2)[0].max(dim=2)[0]
+        feat = torch.cat([_mean, _std, _max], dim=1)
+        b, c, _, _ = x.shape
+        y = self.fc(feat).view(b, c, 1, 1)
+        return x * y
+
+class DownBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, mid_channels=None, kernels=None):
+        super(DownBlock, self).__init__()
+        
+        if isinstance(kernels, int):
+            assert mid_channels is None
+            self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=kernels, stride = 2,padding=kernels//2),
+            nn.ReLU(inplace=False)
+        )
+        else:
+            if mid_channels is None:
+                mid_channels = out_channels
+            i_channels = [in_channels] + [mid_channels] * (len(kernels) - 1)
+            o_channels = [mid_channels] * (len(kernels) - 1) + [out_channels]
+            conv = [nn.Sequential(
+                nn.Conv2d(i_channels[0], o_channels[0], kernel_size=kernels[0], stride = 2,padding=kernels[0]//2),
+                nn.ReLU(inplace=False)
+            )]
+            for i in range(1, len(kernels)):
+                conv.append(nn.Sequential(
+                    nn.Conv2d(i_channels[i], o_channels[i], kernel_size=kernels[i], padding=kernels[i]//2),
+                    nn.ReLU(inplace=False)
+                ))
+            self.conv = nn.Sequential(*conv)
+
+    def forward(self, x):
+        return self.conv(x)
+
+class UpBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, mid_channels=None, add_channels=None, kernels=None,
+                bilinear=False, shape=None):
+        super(UpBlock, self).__init__()
+        if mid_channels is None:
+            mid_channels = out_channels
+        if isinstance(mid_channels, int):
+            i_channels = [in_channels] + [mid_channels] * (len(kernels) - 1)
+            o_channels = [mid_channels] * (len(kernels) - 1) + [out_channels]
+        else:
+            assert isinstance(mid_channels, list) or isinstance(mid_channels, tuple)
+            assert len(mid_channels) == len(kernels) - 1
+            i_channels = [in_channels] + list(mid_channels)
+            o_channels = list(mid_channels) + [out_channels]
+        if bilinear:
+            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+            if not add_channels is None:
+                i_channels[0] = i_channels[0] + add_channels
+            conv = []
+            for i in range(len(kernels)):
+                conv.append(nn.Sequential(
+                    nn.Conv2d(i_channels[i], o_channels[i], kernel_size=kernels[i],padding=kernels[i]//2),
+                    nn.ReLU(inplace=False)
+                ))
+            self.conv = nn.Sequential(*conv)
+        else:
+            self.up = nn.ConvTranspose2d(i_channels[0], o_channels[0], kernel_size=kernels[0], stride=2,
+                                         padding=kernels[0] // 2, output_padding=1)
+            if not add_channels is None:
+                i_channels[1] = i_channels[1] + add_channels
+            conv = []
+            for i in range(1, len(kernels)):
+                conv.append(nn.Sequential(
+                    nn.Conv2d(i_channels[i], o_channels[i], kernel_size=kernels[i],padding=kernels[i]//2),
+                    nn.ReLU(inplace=False)
+                ))
+            self.conv = nn.Sequential(*conv)
+
+    def forward(self, x, feat=None, shape=None):
+        assert not feat is None or not shape is None
+        up = self.up(x)
+        up = pad(up, ref=feat, h=None if shape is None else shape[0], w=None if shape is None else shape[1])
+        if not feat is None:
+            return self.conv(torch.cat([up, feat], dim=1))
+        else:
+            return self.conv(up)
+        
+class DilationBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, mid_channels, dilations):
+        super(DilationBlock, self).__init__()
+        i_channels = [in_channels] + [mid_channels] * (len(dilations) - 1)
+        o_channels = [mid_channels] * len(dilations)
+        conv_layers = []
+        for i in range(len(dilations)):
+            conv_layer = nn.Sequential(
+                nn.Conv2d(i_channels[i], o_channels[i], kernel_size=3,padding=dilations[i],dilation=dilations[i]),
+                nn.ReLU(inplace=False)
+            )
+            conv_layers.append(conv_layer)
+        self.out = nn.Sequential(
+                nn.Conv2d(in_channels + mid_channels, out_channels, kernel_size=1,padding=0,dilation=1),
+                nn.ReLU(inplace=False)
+            )
+
+    def forward(self, x):
+        conv = self.conv_layers(x)
+        out = self.out(torch.cat([x, conv], dim=1))
+        return out
+
+class PyramidPooling(nn.Module):
+    def __init__(self, in_channels, out_channels, scales=(4, 8, 16, 32), ct_channels=1):
+        super().__init__()
+        self.stages = []
+        self.stages = nn.ModuleList([self._make_stage(in_channels, scale, ct_channels) for scale in scales])
+        self.bottleneck = nn.Conv2d(in_channels + len(scales) * ct_channels, out_channels, kernel_size=1, stride=1)
+        self.relu = nn.LeakyReLU(0.2, inplace=True)
+
+    def _make_stage(self, in_channels, scale, ct_channels):
+        prior = nn.AvgPool2d(kernel_size=(scale, scale))
+        conv = nn.Conv2d(in_channels, ct_channels, kernel_size=1, bias=False)
+        relu = nn.LeakyReLU(0.2, inplace=True)
+        return nn.Sequential(prior, conv, relu)
+
+    def forward(self, feats):
+        h, w = feats.size(2), feats.size(3)
+        priors = torch.cat(
+            [F.interpolate(input=stage(feats), size=(h, w), mode='nearest') for stage in self.stages] + [feats], dim=1)
+        return self.relu(self.bottleneck(priors))
+    
+class res_block(nn.Module):
+    def __init__(self):
+        super(res_block, self).__init__()
+        self.gated_conv1 = GatedConv(in_channels=256,out_channels=256,kernel_size=2,stride=1,padding = 1)
+        self.dilation_layer1 = nn.Conv2d(in_channels=256,out_channels=256,kernel_size=2,stride=1,padding = 1)
+
+        self.gated_conv2 = GatedConv(in_channels=256,out_channels=256,kernel_size=2,stride=1,padding = 1)
+        self.dilation_layer2 = nn.Conv2d(in_channels=256,out_channels=256,kernel_size=2,stride=1,padding = 1)
+
+        self.gated_conv3 = GatedConv(in_channels=256,out_channels=256,kernel_size=2,stride=1,padding = 1)
+        self.dilation_layer3 = nn.Conv2d(in_channels=256,out_channels=256,kernel_size=2,stride=1,padding = 1)
+
+        self.ppm = PyramidPooling(256, 256, ct_channels=256)
+
+    def forward(self, x):
+        res = self.gated_conv1(x)
+        res = self.dilation_layer1(res)
+        res1 = res+x*0.1
+        res = res+x*0.1
+
+        res = self.gated_conv2(res)
+        res = self.dilation_layer2(res)
+        res2 = res+res1*0.1
+        res = res+res1*0.1
+
+        res = self.gated_conv3(res)
+        res = self.dilation_layer3(res)
+        res3 = res+res2*0.1
+
+        output = self.ppm(res3)
+        return output
+
+class Encoder_DE(nn.Module):
+    def __init__(self):
+        super(Encoder_DE,self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=7, padding=3),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(64, 64, kernel_size=7, padding=3),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(64, 64, kernel_size=7, padding=3),
+            nn.ReLU(inplace=False),
+            DownBlock(64, 128, kernels=[3, 3]),
+            DilationBlock(128, 128, 128, dilations=[2, 4]),
+            DownBlock(128, 256, kernels=[3, 3]),
+            DilationBlock(256, 256, 256, dilations=[2, 4]),
+            res_block(256, blocks=3, resscale=0.1, kernel_size=3, gatedconv=True, dilations=[2, 4])
+        )
+    def forward(self,image):
+        feature = self.encoder(image)
+        return feature
+
+class Decoder_DE(nn.Module):
+    def __init__(self):
+        super(Decoder_DE,self).__init__()
+        self.decoder = nn.Sequential(
+            UpBlock(256, 128, 128, add_channels=128, kernels=[5, 5], bilinear=True),
+            UpBlock(128, 64, 64, add_channels=64, kernels=[5, 5], bilinear=True)
+        )#decoder for Detection Branch
+
+    def forward(self,feature):
+        res = self.decoder(feature)
+        return res
+
+'''
+detect branch and elimination branch
+'''
+class Detection_Elimination(nn.Module):
+    def __init__(self):
+        super(Detection_Elimination,self).__init__()
+        self.encoder = Encoder_DE()
+        self.decoder = Decoder_DE()
+        self.conv_D = nn.Sequential(
+            nn.Conv2d(64+3, 64, kernel_size=3, padding=3),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(64, 1, kernel_size=3, padding=1),
+            nn.Sigmoid(),
+        )   
+        self.conv_E = nn.Sequential(
+            nn.Conv2d(64+4, 64, kernel_size=3, padding=3),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(64, 1, kernel_size=3, padding=1),
+            nn.ReLU(inplace=False)
+        )  
+    def forward(self,image):
+        feature = self.encoder(image)
+        decoder_res = self.decoder(feature)
+        detection_res = self.conv_D(decoder_res)
+        elimination_res = self.conv_D(decoder_res)
+        return detection_res,elimination_res,decoder_res
+
+'''
+inpainting branch
+'''
 class Encoder2(nn.Module):
     def __init__(self, in_channels=3, temp_channels=512):
         super(Encoder2, self).__init__()
@@ -77,7 +365,7 @@ class Encoder2(nn.Module):
     
 class Decoder2(nn.Module):
     def __init__(self, temp_channels=1024, out_channels=3):
-        super(Decoder, self).__init__()
+        super(Decoder2, self).__init__()
         self.decoder_conv1 = nn.Sequential(
             nn.Conv2d(1024, 512, kernel_size=3, padding=1),
             nn.BatchNorm2d(512),
@@ -148,7 +436,7 @@ class Decoder2(nn.Module):
         output = self.final_conv(conv4)
 
         return output
-    
+
 class memory_Block(nn.Module):
     def __init__(self,C,M):
         super(memory_Block, self).__init__()
@@ -195,138 +483,24 @@ class memory_Block(nn.Module):
     def forward(self, E):
         pass
 
-class GatedConv(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, bias=True, norm=None,
-        num_groups=8, act='elu', negative_slope=0.1, inplace=True, full=True, reflect=True):
-        super(GatedConv, self).__init__()
-        #conv part 
-        self.conv = nn.Sequential(
-            nn.ReflectionPad2d(padding),
-            nn.Conv2d(in_channels, out_channels, kernel_size,stride,padding = 0,dilation = dilation,bias=bias),
-            nn.ELU(alpha=1.0)
-        )
-        # mask part
-        if full:
-            self.mask = self.conv = nn.Sequential(
-                nn.ReflectionPad2d(padding),
-                nn.Conv2d(in_channels, out_channels, kernel_size,stride,padding = 0,dilation = dilation,bias=bias),
-                nn.Sigmoid()
-            )
-        else:
-            self.mask = self.conv = nn.Sequential(
-                nn.ReflectionPad2d(padding),
-                nn.Conv2d(in_channels, 1, kernel_size,stride,padding = 0,dilation = dilation,bias=bias),
-                nn.Sigmoid()
-            )
-
-    def forward(self, x):
-        return self.conv(x) * self.mask(x)
-
-class Dilation_Layer(nn.Module):
-    def __init__(self, in_channels, reduction=1):
-        super(Dilation_Layer, self).__init__()
-        self.fc = nn.Sequential(
-            nn.Linear( in_channels * 3,  in_channels * 3 // reduction),
-            nn.ELU(inplace=True),
-            nn.Linear( in_channels * 3 // reduction,  in_channels),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        with torch.no_grad():
-            _mean = x.mean(dim=[2, 3])
-            _std = x.std(dim=[2, 3])
-            _max = x.max(dim=2)[0].max(dim=2)[0]
-        feat = torch.cat([_mean, _std, _max], dim=1)
-        b, c, _, _ = x.shape
-        y = self.fc(feat).view(b, c, 1, 1)
-        return x * y
-    
-class PyramidPooling(nn.Module):
-    def __init__(self, in_channels, out_channels, scales=(4, 8, 16, 32), ct_channels=1):
-        super().__init__()
-        self.stages = []
-        self.stages = nn.ModuleList([self._make_stage(in_channels, scale, ct_channels) for scale in scales])
-        self.bottleneck = nn.Conv2d(in_channels + len(scales) * ct_channels, out_channels, kernel_size=1, stride=1)
-        self.relu = nn.LeakyReLU(0.2, inplace=True)
-
-    def _make_stage(self, in_channels, scale, ct_channels):
-        prior = nn.AvgPool2d(kernel_size=(scale, scale))
-        conv = nn.Conv2d(in_channels, ct_channels, kernel_size=1, bias=False)
-        relu = nn.LeakyReLU(0.2, inplace=True)
-        return nn.Sequential(prior, conv, relu)
-
-    def forward(self, feats):
-        h, w = feats.size(2), feats.size(3)
-        priors = torch.cat(
-            [F.interpolate(input=stage(feats), size=(h, w), mode='nearest') for stage in self.stages] + [feats], dim=1)
-        return self.relu(self.bottleneck(priors))
-    
-class res_block(nn.Module):
-    def __init__(self):
-        super(res_block, self).__init__()
-        self.gated_conv1 = GatedConv(in_channels=256,out_channels=256,kernel_size=2,stride=1,padding = 1)
-        self.dilation_layer1 = nn.Conv2d(in_channels=256,out_channels=256,kernel_size=2,stride=1,padding = 1)
-
-        self.gated_conv2 = GatedConv(in_channels=256,out_channels=256,kernel_size=2,stride=1,padding = 1)
-        self.dilation_layer2 = nn.Conv2d(in_channels=256,out_channels=256,kernel_size=2,stride=1,padding = 1)
-
-        self.gated_conv3 = GatedConv(in_channels=256,out_channels=256,kernel_size=2,stride=1,padding = 1)
-        self.dilation_layer3 = nn.Conv2d(in_channels=256,out_channels=256,kernel_size=2,stride=1,padding = 1)
-
-        self.ppm = PyramidPooling(256, 256, ct_channels=256)
-
-    def forward(self, x):
-        res = self.gated_conv1(x)
-        res = self.dilation_layer1(res)
-        res1 = res+x*0.1
-        res = res+x*0.1
-
-        res = self.gated_conv2(res)
-        res = self.dilation_layer2(res)
-        res2 = res+res1*0.1
-        res = res+res1*0.1
-
-        res = self.gated_conv3(res)
-        res = self.dilation_layer3(res)
-        res3 = res+res2*0.1
-
-        output = self.ppm(res3)
-        return output
-
-class Detection(nn.Module):
-    def __init__(self,decoder1):
-        super(Detection,self).__init__()
-        self.decoder = decoder1#decoder for Detection Branch
-        
-    def forward(self,feature):
-        detection_res = self.decoder(feature)
-        return detection_res
-        
 class Inpainting(nn.Module):
-    def __init__(self,decoder2,memory_block):
+    def __init__(self,encoder2,decoder2,memory_block):
         super(Inpainting,self).__init__()
+        self.encoder = encoder2
         self.decoder = decoder2#decoder for Inpainting Branch
         self.memory_block = memory_block
 
-    def forward(self,feature,detection_res):
+    def forward(self,image,detection_res):
+        feature  = self.encoder(image)
         detection_res = cv2.resize(detection_res)
         new_feature = detection_res*feature 
         update_feature = self.memory_block(new_feature)
         inpaint_output = self.decoder(update_feature)
         return inpaint_output
 
-class Elimination(nn.Module):
-    def __init__(self,decoder3,res_block):
-        super(Elimination,self).__init__()
-        self.decoder = decoder3#decoder for Elimination Branch
-        self.res_block = res_block
-
-    def forward(self,feature):
-        decode_res = self.decoder(feature)
-        elimination_res = self.res_block(decode_res)
-        return elimination_res
-
+'''
+RFM
+'''
 class RFM(nn.Module):    
     def __init__(self):
         super(RFM,self).__init__()
@@ -357,71 +531,132 @@ class RFM(nn.Module):
         x = self.acti3(x)
         x = self.conv4(x)
         x = self.bn2(x)
-        return x
-    
+        return x,weight_map
+
+'''
+eye flow net
+'''
 class eyeFlowNet(nn.Module):
     def __init__(self):
         super(eyeFlowNet,self).__init__()
-        self.encoder =  nn.Conv2d(in_channels=in_channels,out_channels=out_channels,kernel_size=1,stride=stride,padding = padding)
-        self.decoder =  nn.Conv2d(in_channels=in_channels,out_channels=out_channels,kernel_size=1,stride=stride,padding = padding)
+        self.encoder =  nn.Sequential(
+            nn.Conv2d(6, 64, kernel_size=3, padding=1, stride=2),
+            nn.LeakyReLU(negative_slope=0.1, inplace=False),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1, stride=2),
+            nn.BatchNorm2d(num_features=64),
+            nn.LeakyReLU(negative_slope=0.1, inplace=False),
+            nn.Conv2d(128, 256, kernel_size=3, padding=1, stride=2),
+            nn.BatchNorm2d(num_features=64),
+            nn.LeakyReLU(negative_slope=0.1, inplace=False),
+            nn.Conv2d(256, 512, kernel_size=3, padding=1, stride=2),
+            nn.BatchNorm2d(num_features=64),
+            nn.LeakyReLU(negative_slope=0.1, inplace=False),
+            nn.Conv2d(512, 1024, kernel_size=3, padding=1, stride=2),
+            nn.BatchNorm2d(num_features=64),
+            nn.LeakyReLU(negative_slope=0.1, inplace=False)
+            )
+        self.decoder =  nn.Sequential(
+            nn.Conv2d(1024, 512, kernel_size=3, padding=1, stride=2),
+            nn.BatchNorm2d(num_features=64),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(512, 256, kernel_size=3, padding=1, stride=2),
+            nn.BatchNorm2d(num_features=64),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(256, 128, kernel_size=3, padding=1, stride=2),
+            nn.BatchNorm2d(num_features=64),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(128,64, kernel_size=3, padding=1, stride=2),
+            nn.BatchNorm2d(num_features=64),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(64, 2, kernel_size=3, padding=1, stride=2),
+            nn.Tanh(inplace=False),
+            )
 
     def forward(self,I_eye,I_eye_prime):
-        flow = self.decoder(self.encoder(I_eye,I_eye_prime))
+        flow = self.decoder(self.encoder(torch.cat([I_eye,I_eye_prime],dim=1)))
         return flow
 
+'''
+MTnet
+'''
 class MTNet(LightningModule):
-    def __init__(self,encoder,detection,inpaint,eliminate,RFM,eye_symmetry_loss_module,fusion_weight_loss_module):
+    def __init__(self,C,M,RFM,eyeFlowNet,L_rec_module,L_p_module,L_focal_module,L_weight_module,L_flow_module,L_eye_module,lr):
         super().__init__()
-        self.encoder = encoder#output H W C
-        self.detection = detection#output hwc and resized to HWC
-        self.inpaint = inpaint
-        self.eliminate = eliminate
+        self.de = Detection_Elimination()
+        self.inpaint = Inpainting(encoder2=Encoder2(),decoder2=Decoder2(),memory_block=memory_Block(C,M))
         self.RFM = RFM
-        self.eye_symmetry_loss_module = eye_symmetry_loss_module
-        self.fusion_weight_loss_module = fusion_weight_loss_module
+        self.final_removel = nn.Sequential(
+            GatedConv(64 + 7, 64, kernel_size=7, padding=3),
+            res_block(64, blocks=3, resscale=1.0, kernel_size=3, gatedconv=True, dilations=[2, 4]),
+            nn.Sequential(64, 3, kernel_size=3, padding=1),
+            nn.ReLU6(inplace=False)
+        )
+        self.eyeFlowNet = eyeFlowNet
+        self.L_rec_module = L_rec_module
+        self.L_p_module = L_p_module
+        self.L_focal_module = L_focal_module
+        self.L_weight_module = L_weight_module
+        self.L_flow_module = L_flow_module
+        self.L_eye_module = L_eye_module
+        self.lr = lr
+        self.automatic_optimization = False
         
     def forward(self,image):
-        feature = self.encoder(image)
-        detection_res = self.detection(feature)
-        inpaint_res = self.inpaint(feature)
-        eliminate_res = self.eliminate(feature)
-        output_img = self.RFM(detection_res,inpaint_res,eliminate_res)
-        return output_img
-            
+        detection,eliminate,decoder_res = self.de(image)
+        inpaint = self.inpaint(image,detection)
+        _,weight_map  = self.RFM(eliminate,inpaint,detection)
+        res = self.final_removel(torch.cat([image, eliminate, decoder_res, detection], dim=1))
+        return detection,res,weight_map
+                
     def training_step(self,batch):
+        optimizer_eye, optimizer_all = self.optimizers()
+        current_epoch = self.current_epoch
         image,gt = batch
-        output_img = self.forward(image)
-        flipped_gt = torch.flip(gt)
-        eye_symmetry_loss = self.eye_symmetry_loss_module(output_img,flipped_gt)
-        fusion_weight_loss = self.fusion_weight_loss_module(output_img,flipped_gt)
-        loss = loss.to(self.device)
+        if current_epoch<40:
+            face_flip_batch = torch.flip(image, dims=[3])  # dims=[3] 表示水平翻转宽度方向
+            flow = self.eyeFlowNet(image,face_flip_batch)
+            loss = self.L_eye_module(image,face_flip_batch,flow)
+            loss = loss.to(self.device)
+            optimizer_eye.zero_grad()
+            self.manual_backward(loss)
+            optimizer_eye.step()
+        else:
+            detection,res,weight_map = self.forward(image)
+            delta = image - gt
+            mask = 0.3 * delta[:, 0, :, :] + 0.59 *  delta[:, 1, :, :] + 0.11 * delta[:, 2, :, :]
+            mask_max = mask.max(dim=[1, 2], keepdim=True).values  
+            mask_binary = (mask > 0.707 * mask_max).float() 
+            flow = self.eyeFlowNet(image,face_flip_batch)
+            loss = 0
+            loss_rec = self.L_rec_module(image,gt)
+            loss_p = self.L_p_module(image,gt)*0.01
+            loss_focal = self.L_focal_module(detection,mask_binary)
+            loss_weight = self.L_weight_module(delta,weight_map)*10
+            loss_flow = self.L_flow_module(image,flow)
+            face_flip_batch = torch.flip(image, dims=[3])  # dims=[3] 表示水平翻转宽度方向
+            loss_eye = self.L_eye_module(image,face_flip_batch,flow)
+            loss = loss_rec + loss_p + loss_focal + loss_weight + loss_flow + loss_eye
+            loss = loss.to(self.device)
+            optimizer_all.zero_grad()
+            self.manual_backward(loss)
+            optimizer_all.step()
+
         self.log('training loss',loss,on_step = False, on_epoch = True,prog_bar = True,logger = True, sync_dist=True)
         current_lr = self.trainer.optimizers[0].param_groups[0]['lr']
         self.log('learning rate',current_lr,on_step = False, on_epoch = True,prog_bar = False,logger = True, sync_dist=True)
         return loss          
     
     def validation_step(self,batch,batch_idx):
-        image,gt = batch
-        output_img = self.forward(image)
-        flipped_gt = torch.flip(gt)
-        eye_symmetry_loss = self.eye_symmetry_loss_module(output_img,flipped_gt)
-        fusion_weight_loss = self.fusion_weight_loss_module(output_img,flipped_gt)
-        loss = loss.to(self.device)
-        
+        image,_ = batch
+        _,output_img,_ = self.forward(image)
         self.logger.experiment.add_image('source_img',image[0]/2+0.5,self.current_epoch)
         self.logger.experiment.add_image('outpur_img',output_img[0]/2+0.5,self.current_epoch)
-        self.log('val_loss',loss,on_step = False, on_epoch = True,prog_bar = True,logger = True, sync_dist=True)
-        return loss
 
     def configure_optimizers(self):
-        optimizer = Adam(self.parameters(), lr=self.lr)
-        lr_scheduler_type = self.lr_scheduler
-        if 'step' in lr_scheduler_type.lower():
-            #scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,milestones = [500,1000,1500],gamma = 0.1)
-            #scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,milestones = [500,1000,1500],gamma = 0.1)
-            scheduler = torch.optim.lr_scheduler.StepLR(optimizer,step_size = 400,gamma = 0.1)
-        else:
-            scheduler = {"scheduler":torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,patience = 10),
-                        "monitor":"val loss"}
-        optim_dict = {'optimizer':optimizer,'lr_scheduler':scheduler}
+        optimizer_eye = Adam(self.eyeFlowNet.parameters(), lr=self.lr)
+        scheduler_eye = torch.optim.lr_scheduler.StepLR(optimizer_eye,step_size = 5,gamma = 0.4)
+        optimizer_all = Adam(self.parameters(), lr=self.lr)
+        scheduler_all = torch.optim.lr_scheduler.StepLR(optimizer_all,step_size = 5,gamma = 0.4)
+        optim_dict = {'optimizer_eye':optimizer_eye,'lr_scheduler_eye':scheduler_eye,
+                    'optimizer_eye':optimizer_all,'lr_scheduler_eye':scheduler_all}
         return optim_dict
