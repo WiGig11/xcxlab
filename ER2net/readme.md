@@ -1,5 +1,10 @@
 # THis is a readme file for the work titiled:
 《Eyeglass Reflection Removal with Joint Learning of Reflection Elimination and Content Inpainting》
+## main contribution
+1.proposed a new dataset 
+2.proposed a new removal network to remove reflection , contains three branches for detecting reflection area, remove reflection and inpaint eye to avoid artifect. Three res are fused together to generate final res.
+
+3.proposed a eye symmetry loss to regurlate the res.
 
 ## overall structure
 ### A shared Encoder
